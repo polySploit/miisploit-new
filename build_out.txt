@@ -1,0 +1,4 @@
+[ 50%]: compiling.release src\main.cpp
+[ 75%]: linking.release poly.dll
+[100%]: build ok, spent 8.5s
+
