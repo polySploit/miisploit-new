@@ -7,8 +7,10 @@
         {
             "-nologo",
             "-machine:x64",
+            [[-libpath:C:\Users\Administrator\AppData\Local\.xmake\packages\m\minhook\v1.3.4\42db4578518a4e7dab516663d1f46c6b\lib]],
             "/opt:ref",
             "/opt:icf",
+            "minhook.lib",
             "user32.lib",
             "gdi32.lib",
             "comctl32.lib",

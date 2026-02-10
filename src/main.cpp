@@ -10,6 +10,7 @@
 #include <ctime>
 #include <ShlObj.h>
 #include "unity.hpp"
+#include <MinHook.h>
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 using U = UnityResolve;
@@ -38,9 +39,31 @@ static HWND g_hOutputLog = NULL;
 static HWND g_hCreditsLabel1 = NULL;
 static HWND g_hCreditsLabel2 = NULL;
 static HWND g_hCreditsLabel3 = NULL;
+static HWND g_hNetLog = NULL;
+static HWND g_hBtnNetClear = NULL;
+static HWND g_hPropListView = NULL;
+static HWND g_hPropEdit = NULL;
+static HWND g_hPropCombo = NULL;
 static void ShowTabControls(int tab);
 static std::mutex g_LogMutex;
 static std::vector<std::string> g_LogLines;
+static std::mutex g_NetLogMutex;
+static bool g_NetHooksInstalled = false;
+static std::vector<std::string> g_NetLogBuffer;
+static const UINT_PTR IDT_NET_FLUSH = 9001;
+static void* g_SelectedInstance = nullptr;
+static int g_EditingPropRow = -1;
+struct PropEntry {
+    std::string name;
+    std::string typeName;
+    int offset;
+    bool isEnum;
+    void* enumClassAddr;
+    std::vector<std::pair<std::string, int>> enumValues;
+};
+static std::vector<PropEntry> g_PropEntries;
+static WNDPROC g_OrigPropEditProc = nullptr;
+static WNDPROC g_OrigPropComboProc = nullptr;
 #include <unordered_map>
 static std::unordered_map<HTREEITEM, void*> g_TreeItemToInstance;
 enum {
@@ -51,7 +74,7 @@ enum {
     IDC_BTN_CLONE,
     IDC_EDIT_NAME,
     IDC_BTN_SET_NAME,
-    IDC_LIST_PROPS = 1100, 
+    IDC_LIST_PROPS = 1100,
     IDC_EDIT_CMD,
     IDC_CMD_LOG,
     IDC_BTN_RUN_CMD,
@@ -61,6 +84,11 @@ enum {
     IDC_BTN_LOAD_FILE,
     IDC_STATUS_LABEL,
     IDC_OUTPUT_LOG,
+    IDC_NET_LOG = 1200,
+    IDC_BTN_NET_CLEAR,
+    IDC_PROP_LISTVIEW = 1300,
+    IDC_PROP_EDIT,
+    IDC_PROP_COMBO,
     ID_CTX_COPY_PATH = 2000,
     ID_CTX_DECOMPILE
 };
@@ -87,6 +115,91 @@ void SetStatus(const std::string& status) {
         SetWindowTextA(g_hStatusLabel, status.c_str());
     }
 }
+void LogNet(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_NetLogMutex);
+    g_NetLogBuffer.push_back(msg);
+}
+static void FlushNetLog() {
+    std::vector<std::string> batch;
+    {
+        std::lock_guard<std::mutex> lock(g_NetLogMutex);
+        if (g_NetLogBuffer.empty()) return;
+        batch.swap(g_NetLogBuffer);
+    }
+    if (!g_hNetLog) return;
+    std::string combined;
+    for (size_t i = 0; i < batch.size(); i++) {
+        if (i > 0) combined += "\r\n";
+        combined += batch[i];
+    }
+    int len = GetWindowTextLengthA(g_hNetLog);
+    if (len > 50000) {
+        SetWindowTextA(g_hNetLog, "");
+        len = 0;
+    }
+    SendMessageA(g_hNetLog, EM_SETSEL, len, len);
+    std::string line = (len > 0 ? "\r\n" : "") + combined;
+    SendMessageA(g_hNetLog, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    SendMessageA(g_hNetLog, EM_SCROLLCARET, 0, 0);
+}
+typedef void(__fastcall* InvokeOriginal_t)(void*, void*, void*);
+static InvokeOriginal_t oInvokeServer = nullptr;
+static InvokeOriginal_t oInvokeClient = nullptr;
+static std::string StringifyIl2CppObject(void* obj) {
+    if (!obj) return "nil";
+    try {
+        static auto* get_class_fn = (void*(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_object_get_class");
+        static auto* class_get_name_fn = (const char*(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_class_get_name");
+        if (!get_class_fn || !class_get_name_fn) return "???";
+        void* klass = get_class_fn(obj);
+        if (!klass) return "???";
+        const char* className = class_get_name_fn(klass);
+        if (!className) return "???";
+        std::string cn(className);
+        if (cn == "String") {
+            auto* str = reinterpret_cast<UnityResolve::UnityType::String*>(obj);
+            if (str && str->m_stringLength > 0 && str->m_stringLength < 4096) {
+                return "\"" + str->ToString() + "\"";
+            }
+            return "\"\"";
+        }
+        if (cn == "Int32") {
+            int val = *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(obj) + 0x10);
+            return std::to_string(val);
+        }
+        if (cn == "Single") {
+            float val = *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(obj) + 0x10);
+            char buf[64];
+            sprintf_s(buf, "%.4f", val);
+            return std::string(buf);
+        }
+        if (cn == "Boolean") {
+            bool val = *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(obj) + 0x10);
+            return val ? "true" : "false";
+        }
+        return "<" + cn + ">";
+    } catch (...) {
+        return "???";
+    }
+}
+static std::string StringifyArgs(void* argsArray) {
+    if (!argsArray) return "(none)";
+    try {
+        auto* arr = reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(argsArray);
+        int count = (int)arr->max_length;
+        if (count <= 0 || count > 50) return "(none)";
+        std::string result;
+        for (int i = 0; i < count; i++) {
+            void* elem = arr->At(i);
+            if (i > 0) result += ", ";
+            result += StringifyIl2CppObject(elem);
+        }
+        return result;
+    } catch (...) {
+        return "(error)";
+    }
+}
+
 void RunLuaScript(const std::string& script)
 {
     const auto pAssembly = U::Get("Assembly-CSharp.dll");
@@ -480,6 +593,86 @@ static void SetSelectedName() {
         LogOutput("[Explorer] Error setting name");
     }
 }
+static std::string GetNetworkEventName(void* instance) {
+    if (!instance) return "???";
+    try {
+        if (g_API.instanceGetName) {
+            auto fn = g_API.instanceGetName->Cast<UnityResolve::UnityType::String*, void*>();
+            if (fn) {
+                auto* nameStr = fn(instance);
+                if (nameStr && nameStr->m_stringLength > 0) {
+                    return nameStr->ToString();
+                }
+            }
+        }
+        return "???";
+    } catch (...) {
+        return "???";
+    }
+}
+void __fastcall hkInvokeServer(void* thisPtr, void* args, void* methodInfo) {
+    try {
+        std::string name = GetNetworkEventName(thisPtr);
+        std::string argStr = StringifyArgs(args);
+        LogNet(name + " | Server | " + argStr);
+    } catch (...) {}
+    if (oInvokeServer) oInvokeServer(thisPtr, args, methodInfo);
+}
+void __fastcall hkInvokeClient(void* thisPtr, void* args, void* methodInfo) {
+    try {
+        std::string name = GetNetworkEventName(thisPtr);
+        std::string argStr = StringifyArgs(args);
+        LogNet(name + " | Client | " + argStr);
+    } catch (...) {}
+    if (oInvokeClient) oInvokeClient(thisPtr, args, methodInfo);
+}
+static bool InitNetworkHooks() {
+    if (g_NetHooksInstalled) return true;
+    try {
+        const auto pAssembly = U::Get("Assembly-CSharp.dll");
+        if (!pAssembly) { LogOutput("[NetSpy] Assembly-CSharp.dll not found"); return false; }
+        auto* netEventClass = pAssembly->Get("NetworkEvent", "Polytoria.Datamodel");
+        if (!netEventClass) netEventClass = pAssembly->Get("NetworkEvent");
+        if (!netEventClass) { LogOutput("[NetSpy] NetworkEvent class not found"); return false; }
+        auto* invokeServerMethod = netEventClass->Get<U::Method>("InvokeServer");
+        auto* invokeClientMethod = netEventClass->Get<U::Method>("InvokeClient");
+        if (!invokeServerMethod && !invokeClientMethod) {
+            LogOutput("[NetSpy] Neither InvokeServer nor InvokeClient found");
+            return false;
+        }
+        int hooked = 0;
+        if (invokeServerMethod) {
+            invokeServerMethod->Compile();
+            if (invokeServerMethod->function) {
+                if (MH_CreateHook(invokeServerMethod->function, &hkInvokeServer, (void**)&oInvokeServer) == MH_OK) {
+                    MH_EnableHook(invokeServerMethod->function);
+                    hooked++;
+                    LogOutput("[NetSpy] Hooked InvokeServer");
+                }
+            }
+        }
+        if (invokeClientMethod) {
+            invokeClientMethod->Compile();
+            if (invokeClientMethod->function) {
+                if (MH_CreateHook(invokeClientMethod->function, &hkInvokeClient, (void**)&oInvokeClient) == MH_OK) {
+                    MH_EnableHook(invokeClientMethod->function);
+                    hooked++;
+                    LogOutput("[NetSpy] Hooked InvokeClient");
+                }
+            }
+        }
+        if (hooked > 0) {
+            g_NetHooksInstalled = true;
+            LogOutput("[NetSpy] Network hooks installed (" + std::to_string(hooked) + " methods)");
+            return true;
+        }
+        LogOutput("[NetSpy] Failed to hook any methods");
+        return false;
+    } catch (...) {
+        LogOutput("[NetSpy] Exception during hook init");
+        return false;
+    }
+}
 static void RefreshInfo(void* instance) {
     SendMessageA(g_hListInfo, LB_RESETCONTENT, 0, 0);
     if (!IsValidPtr(instance)) return;
@@ -503,6 +696,261 @@ static void RefreshInfo(void* instance) {
     }
     std::string clsStr = "Class: " + className;
     SendMessageA(g_hListInfo, LB_ADDSTRING, 0, (LPARAM)clsStr.c_str());
+}
+static std::string ReadFieldValue(void* instance, const PropEntry& prop) {
+    if (!instance || prop.offset <= 0) return "???";
+    try {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(instance) + prop.offset;
+        if (IsBadReadPtr((void*)addr, 4)) return "<invalid>";
+        const std::string& t = prop.typeName;
+        if (t == "System.Int32" || t == "Int32" || t == "int") {
+            int v = *(int*)addr;
+            if (prop.isEnum) {
+                for (auto& ev : prop.enumValues) {
+                    if (ev.second == v) return ev.first;
+                }
+            }
+            return std::to_string(v);
+        }
+        if (t == "System.Single" || t == "Single" || t == "float") {
+            char buf[64]; sprintf_s(buf, "%.4f", *(float*)addr);
+            return buf;
+        }
+        if (t == "System.Boolean" || t == "Boolean" || t == "bool") {
+            return *(bool*)addr ? "true" : "false";
+        }
+        if (t == "System.String" || t == "String") {
+            auto* str = *(UnityResolve::UnityType::String**)addr;
+            if (str && !IsBadReadPtr(str, sizeof(void*)) && str->m_stringLength > 0 && str->m_stringLength < 4096) {
+                return str->ToString();
+            }
+            return "";
+        }
+        if (t == "UnityEngine.Vector3" || t == "Vector3") {
+            float* f = (float*)addr;
+            char buf[128]; sprintf_s(buf, "%.3f, %.3f, %.3f", f[0], f[1], f[2]);
+            return buf;
+        }
+        if (t == "UnityEngine.Color" || t == "Color" || t == "Color3") {
+            float* f = (float*)addr;
+            char buf[128]; sprintf_s(buf, "%.3f, %.3f, %.3f", f[0], f[1], f[2]);
+            return buf;
+        }
+        if (prop.isEnum) {
+            int v = *(int*)addr;
+            for (auto& ev : prop.enumValues) {
+                if (ev.second == v) return ev.first;
+            }
+            return std::to_string(v);
+        }
+        return "<" + t + ">";
+    } catch (...) { return "???"; }
+}
+static void RefreshProperties(void* instance) {
+    g_SelectedInstance = instance;
+    g_PropEntries.clear();
+    g_EditingPropRow = -1;
+    if (g_hPropEdit) ShowWindow(g_hPropEdit, SW_HIDE);
+    if (g_hPropCombo) ShowWindow(g_hPropCombo, SW_HIDE);
+    ListView_DeleteAllItems(g_hPropListView);
+    if (!IsValidPtr(instance)) return;
+    static auto* get_class = (void*(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_object_get_class");
+    static auto* class_get_name = (const char*(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_class_get_name");
+    static auto* class_get_parent = (void*(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_class_get_parent");
+    static auto* class_is_enum = (bool(*)(void*))GetProcAddress(GetModuleHandleA("GameAssembly.dll"), "il2cpp_class_is_enum");
+    if (!get_class || !class_get_name) return;
+    void* runtimeClass = get_class(instance);
+    if (!runtimeClass) return;
+    const char* mainClassName = class_get_name(runtimeClass);
+    if (!mainClassName) mainClassName = "?";
+    const auto pAssembly = U::Get("Assembly-CSharp.dll");
+    if (!pAssembly) return;
+    std::vector<std::pair<std::string, U::Class*>> classChain;
+    void* curClass = runtimeClass;
+    while (curClass) {
+        const char* cn = class_get_name(curClass);
+        if (!cn) break;
+        std::string cname(cn);
+        if (cname == "Object" || cname == "MonoBehaviour" || cname == "Behaviour" || cname == "Component") break;
+        for (auto* cls : pAssembly->classes) {
+            if (cls->address == curClass) {
+                classChain.push_back({cname, cls});
+                break;
+            }
+        }
+        if (class_get_parent) curClass = class_get_parent(curClass);
+        else break;
+    }
+    int row = 0;
+    for (auto& [clsName, cls] : classChain) {
+        for (auto* field : cls->fields) {
+            if (!field || field->static_field) continue;
+            if (field->offset <= 0) continue;
+            if (field->name.empty() || field->name[0] == '<') continue;
+            PropEntry prop;
+            prop.name = clsName + "." + field->name;
+            prop.typeName = field->type ? field->type->name : "???";
+            prop.offset = field->offset;
+            prop.isEnum = false;
+            prop.enumClassAddr = nullptr;
+            if (field->type && class_is_enum) {
+                for (auto* ecls : pAssembly->classes) {
+                    if (ecls->name == field->type->name) {
+                        if (class_is_enum(ecls->address)) {
+                            prop.isEnum = true;
+                            prop.enumClassAddr = ecls->address;
+                            for (auto* ef : ecls->fields) {
+                                if (ef->static_field && ef->name != "value__") {
+                                    int val = 0;
+                                    try {
+                                        ef->GetStaticValue(&val);
+                                    } catch (...) {}
+                                    prop.enumValues.push_back({ef->name, val});
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            std::string value = ReadFieldValue(instance, prop);
+            g_PropEntries.push_back(prop);
+            LVITEMA lvi = {};
+            lvi.mask = LVIF_TEXT;
+            lvi.iItem = row;
+            lvi.iSubItem = 0;
+            lvi.pszText = (LPSTR)g_PropEntries.back().name.c_str();
+            ListView_InsertItem(g_hPropListView, &lvi);
+            ListView_SetItemText(g_hPropListView, row, 1, (LPSTR)value.c_str());
+            row++;
+        }
+    }
+}
+static bool WriteFieldValue(void* instance, const PropEntry& prop, const std::string& newVal) {
+    if (!instance || prop.offset <= 0) return false;
+    try {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(instance) + prop.offset;
+        const std::string& t = prop.typeName;
+        if (prop.isEnum) {
+            for (auto& ev : prop.enumValues) {
+                if (ev.first == newVal) {
+                    *(int*)addr = ev.second;
+                    return true;
+                }
+            }
+            *(int*)addr = std::stoi(newVal);
+            return true;
+        }
+        if (t == "System.Int32" || t == "Int32" || t == "int") {
+            *(int*)addr = std::stoi(newVal);
+            return true;
+        }
+        if (t == "System.Single" || t == "Single" || t == "float") {
+            *(float*)addr = std::stof(newVal);
+            return true;
+        }
+        if (t == "System.Boolean" || t == "Boolean" || t == "bool") {
+            *(bool*)addr = (newVal == "true" || newVal == "1" || newVal == "True");
+            return true;
+        }
+        if (t == "UnityEngine.Vector3" || t == "Vector3") {
+            float x = 0, y = 0, z = 0;
+            sscanf_s(newVal.c_str(), "%f, %f, %f", &x, &y, &z);
+            float* f = (float*)addr;
+            f[0] = x; f[1] = y; f[2] = z;
+            return true;
+        }
+        if (t == "UnityEngine.Color" || t == "Color" || t == "Color3") {
+            float r = 0, g = 0, b = 0;
+            sscanf_s(newVal.c_str(), "%f, %f, %f", &r, &g, &b);
+            float* f = (float*)addr;
+            f[0] = r; f[1] = g; f[2] = b;
+            return true;
+        }
+        return false;
+    } catch (...) { return false; }
+}
+static void CommitPropEdit() {
+    if (g_EditingPropRow < 0 || g_EditingPropRow >= (int)g_PropEntries.size()) return;
+    char buf[512] = {};
+    if (g_hPropCombo && IsWindowVisible(g_hPropCombo)) {
+        GetWindowTextA(g_hPropCombo, buf, sizeof(buf));
+        ShowWindow(g_hPropCombo, SW_HIDE);
+    } else if (g_hPropEdit && IsWindowVisible(g_hPropEdit)) {
+        GetWindowTextA(g_hPropEdit, buf, sizeof(buf));
+        ShowWindow(g_hPropEdit, SW_HIDE);
+    } else return;
+    std::string newVal(buf);
+    if (WriteFieldValue(g_SelectedInstance, g_PropEntries[g_EditingPropRow], newVal)) {
+        std::string updated = ReadFieldValue(g_SelectedInstance, g_PropEntries[g_EditingPropRow]);
+        ListView_SetItemText(g_hPropListView, g_EditingPropRow, 1, (LPSTR)updated.c_str());
+    }
+    g_EditingPropRow = -1;
+}
+static LRESULT CALLBACK PropEditSubProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        CommitPropEdit();
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        ShowWindow(hwnd, SW_HIDE);
+        g_EditingPropRow = -1;
+        return 0;
+    }
+    if (msg == WM_KILLFOCUS) {
+        CommitPropEdit();
+        return 0;
+    }
+    return CallWindowProcA(g_OrigPropEditProc, hwnd, msg, wParam, lParam);
+}
+static LRESULT CALLBACK PropComboSubProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        ShowWindow(hwnd, SW_HIDE);
+        g_EditingPropRow = -1;
+        return 0;
+    }
+    return CallWindowProcA(g_OrigPropComboProc, hwnd, msg, wParam, lParam);
+}
+static void StartPropEdit(int row) {
+    if (row < 0 || row >= (int)g_PropEntries.size()) return;
+    g_EditingPropRow = row;
+    auto& prop = g_PropEntries[row];
+    RECT rc;
+    ListView_GetSubItemRect(g_hPropListView, row, 1, LVIR_BOUNDS, &rc);
+    POINT pt = {rc.left, rc.top};
+    ClientToScreen(g_hPropListView, &pt);
+    POINT pt2 = {rc.right, rc.bottom};
+    ClientToScreen(g_hPropListView, &pt2);
+    ScreenToClient(g_hMainWnd, &pt);
+    ScreenToClient(g_hMainWnd, &pt2);
+    std::string curVal = ReadFieldValue(g_SelectedInstance, prop);
+    if (prop.isEnum && !prop.enumValues.empty()) {
+        ShowWindow(g_hPropEdit, SW_HIDE);
+        MoveWindow(g_hPropCombo, pt.x, pt.y, pt2.x - pt.x, 200, TRUE);
+        SendMessageA(g_hPropCombo, CB_RESETCONTENT, 0, 0);
+        int selIdx = 0;
+        for (int i = 0; i < (int)prop.enumValues.size(); i++) {
+            SendMessageA(g_hPropCombo, CB_ADDSTRING, 0, (LPARAM)prop.enumValues[i].first.c_str());
+            if (prop.enumValues[i].first == curVal) selIdx = i;
+        }
+        SendMessageA(g_hPropCombo, CB_SETCURSEL, selIdx, 0);
+        ShowWindow(g_hPropCombo, SW_SHOW);
+        SetFocus(g_hPropCombo);
+    } else {
+        const std::string& t = prop.typeName;
+        bool editable = (t == "System.Int32" || t == "Int32" || t == "int" ||
+                        t == "System.Single" || t == "Single" || t == "float" ||
+                        t == "System.Boolean" || t == "Boolean" || t == "bool" ||
+                        t == "UnityEngine.Vector3" || t == "Vector3" ||
+                        t == "UnityEngine.Color" || t == "Color" || t == "Color3");
+        if (!editable) return;
+        ShowWindow(g_hPropCombo, SW_HIDE);
+        MoveWindow(g_hPropEdit, pt.x, pt.y, pt2.x - pt.x, pt2.y - pt.y, TRUE);
+        SetWindowTextA(g_hPropEdit, curVal.c_str());
+        ShowWindow(g_hPropEdit, SW_SHOW);
+        SetFocus(g_hPropEdit);
+        SendMessageA(g_hPropEdit, EM_SETSEL, 0, -1);
+    }
 }
 static int g_DecompileChoice = 0; 
 static LRESULT CALLBACK DecompileDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -693,6 +1141,7 @@ static void ProcessCommand(const std::string& input) {
         LogCmd("=== MiiSploit Commands ===");
         LogCmd("sh <health>     - Set local player health");
         LogCmd("saveinstance    - Save game to Desktop as .poly");
+        LogCmd("instarespawn    - Set respawn time to 0");
         LogCmd("clear           - Clear output log");
         LogCmd("help            - Show this help");
         return;
@@ -713,9 +1162,76 @@ static void ProcessCommand(const std::string& input) {
         SaveInstance();
         return;
     }
+    if (input == "instarespawn") {
+        try {
+            if (!g_API.initialized) g_API.Init();
+            void* gameInstance = GetGameInstance();
+            if (!gameInstance) { LogCmd("[Error] Game instance not found"); return; }
+            auto children = GetInstanceChildren(gameInstance);
+            void* playerDefaults = nullptr;
+            for (int i = 0; i < children.count; i++) {
+                void* child = children.children[i];
+                if (!IsValidPtr(child)) continue;
+                std::string name = SafeGetInstanceName(child);
+                if (name == "PlayerDefaults") {
+                    playerDefaults = child;
+                    break;
+                }
+            }
+            if (!playerDefaults) {
+                auto deepSearch = [&](void* parent, int depth, auto& self) -> void* {
+                    if (depth > 5) return nullptr;
+                    auto ch = GetInstanceChildren(parent);
+                    for (int i = 0; i < ch.count; i++) {
+                        void* c = ch.children[i];
+                        if (!IsValidPtr(c)) continue;
+                        std::string n = SafeGetInstanceName(c);
+                        if (n == "PlayerDefaults") return c;
+                        void* found = self(c, depth + 1, self);
+                        if (found) return found;
+                    }
+                    return nullptr;
+                };
+                playerDefaults = deepSearch(gameInstance, 0, deepSearch);
+            }
+            if (!playerDefaults) { LogCmd("[Error] PlayerDefaults not found"); return; }
+            const auto pAssembly = U::Get("Assembly-CSharp.dll");
+            if (!pAssembly) { LogCmd("[Error] Assembly not found"); return; }
+            U::Class* pdClass = nullptr;
+            void* objClass = UnityResolve::Invoke<void*>("il2cpp_object_get_class", playerDefaults);
+            if (objClass) {
+                for (auto* cls : pAssembly->classes) {
+                    if (cls->address == objClass) {
+                        pdClass = cls;
+                        break;
+                    }
+                }
+            }
+            if (!pdClass) {
+                pdClass = pAssembly->Get("PlayerDefaults", "Polytoria.Datamodel");
+                if (!pdClass) pdClass = pAssembly->Get("PlayerDefaults");
+            }
+            if (!pdClass) { LogCmd("[Error] PlayerDefaults class not found"); return; }
+            U::Field* respawnField = pdClass->Get<U::Field>("RespawnTime");
+            if (!respawnField) respawnField = pdClass->Get<U::Field>("respawnTime");
+            if (!respawnField) respawnField = pdClass->Get<U::Field>("_respawnTime");
+            if (!respawnField) respawnField = pdClass->Get<U::Field>("<RespawnTime>k__BackingField");
+            if (!respawnField || respawnField->offset <= 0) {
+                LogCmd("[Error] RespawnTime field not found");
+                return;
+            }
+            float* respawnPtr = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(playerDefaults) + respawnField->offset);
+            LogCmd("Current RespawnTime: " + std::to_string(*respawnPtr));
+            *respawnPtr = 0.0f;
+            LogCmd("RespawnTime set to 0! Respawn to apply.");
+        } catch (...) {
+            LogCmd("[Exception] Error setting respawn time");
+        }
+        return;
+    }
     LogCmd("Unknown command: " + input + ", please type 'help' for all commands");
 }
-static int g_CurrentTab = 0; 
+static int g_CurrentTab = 0;
 static void ShowTabControls(int tab) {
     g_CurrentTab = tab;
     BOOL showExplorer = (tab == 0) ? SW_SHOW : SW_HIDE;
@@ -725,10 +1241,22 @@ static void ShowTabControls(int tab) {
     ShowWindow(g_hBtnClone, showExplorer);
     ShowWindow(g_hEditName, showExplorer);
     ShowWindow(g_hBtnSetName, showExplorer);
-    ShowWindow(g_hListInfo, showExplorer); 
+    ShowWindow(g_hListInfo, showExplorer);
+    ShowWindow(g_hPropListView, showExplorer);
+    if (!showExplorer) {
+        ShowWindow(g_hPropEdit, SW_HIDE);
+        ShowWindow(g_hPropCombo, SW_HIDE);
+    }
     BOOL showLua = (tab == 1) ? SW_SHOW : SW_HIDE;
     ShowWindow(g_hEditScript, showLua);
-    BOOL showCmd = (tab == 2) ? SW_SHOW : SW_HIDE;
+    BOOL showNet = (tab == 2) ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_hNetLog, showNet);
+    ShowWindow(g_hBtnNetClear, showNet);
+    if (tab == 2 && !g_NetHooksInstalled) {
+        if (!g_API.initialized) g_API.Init();
+        InitNetworkHooks();
+    }
+    BOOL showCmd = (tab == 3) ? SW_SHOW : SW_HIDE;
     ShowWindow(g_hEditCmdLog, showCmd);
     ShowWindow(g_hEditCmd, showCmd);
     ShowWindow(g_hBtnRunCmd, showCmd);
@@ -738,7 +1266,7 @@ static void ShowTabControls(int tab) {
     ShowWindow(g_hBtnClear, showBottomBar ? SW_SHOW : SW_HIDE);
     ShowWindow(g_hBtnLoadFile, showBottomBar ? SW_SHOW : SW_HIDE);
     ShowWindow(g_hStatusLabel, showBottomBar ? SW_SHOW : SW_HIDE);
-    BOOL showCredits = (tab == 3) ? SW_SHOW : SW_HIDE;
+    BOOL showCredits = (tab == 4) ? SW_SHOW : SW_HIDE;
     ShowWindow(g_hCreditsLabel1, showCredits);
     ShowWindow(g_hCreditsLabel2, showCredits);
     ShowWindow(g_hCreditsLabel3, showCredits);
@@ -765,8 +1293,16 @@ static void LayoutControls(int width, int height) {
     int treeWidth = (int)((width - margin * 3) * 0.7f);
     int infoWidth = (width - margin * 3) - treeWidth;
     MoveWindow(g_hTreeView, margin, treeTop, treeWidth, contentH, TRUE);
-    MoveWindow(g_hListInfo, margin + treeWidth + margin, treeTop, infoWidth, contentH, TRUE);
+    int infoX = margin + treeWidth + margin;
+    int infoH = 80;
+    int propH = contentH - infoH - margin;
+    MoveWindow(g_hListInfo, infoX, treeTop, infoWidth, infoH, TRUE);
+    MoveWindow(g_hPropListView, infoX, treeTop + infoH + margin, infoWidth, propH, TRUE);
     MoveWindow(g_hEditScript, margin, contentTop, width - margin * 2, contentHeight, TRUE);
+    int netClearBtnH = 25;
+    int netLogH = contentHeight - netClearBtnH - margin;
+    MoveWindow(g_hNetLog, margin, contentTop, width - margin * 2, netLogH, TRUE);
+    MoveWindow(g_hBtnNetClear, margin, contentTop + netLogH + margin, 80, netClearBtnH, TRUE);
     int cmdInputHeight = 25;
     int cmdLogHeight = height - contentTop - cmdInputHeight - margin * 2;
     MoveWindow(g_hEditCmdLog, margin, contentTop, width - margin * 2, cmdLogHeight, TRUE);
@@ -871,6 +1407,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                       auto it = g_TreeItemToInstance.find(pnmtv->itemNew.hItem);
                       if (it != g_TreeItemToInstance.end()) {
                           RefreshInfo(it->second);
+                          RefreshProperties(it->second);
                           std::string path = GetInstancePath(pnmtv->itemNew.hItem);
                           if (!path.empty()) {
                               std::string p = "Path: " + path;
@@ -878,14 +1415,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                           }
                       } else {
                           SendMessageA(g_hListInfo, LB_RESETCONTENT, 0, 0);
+                          ListView_DeleteAllItems(g_hPropListView);
+                          g_PropEntries.clear();
                       }
                  }
+            }
+        }
+        if (nmhdr->hwndFrom == g_hPropListView && nmhdr->code == NM_DBLCLK) {
+            NMITEMACTIVATE* pnm = (NMITEMACTIVATE*)lParam;
+            if (pnm->iItem >= 0) {
+                StartPropEdit(pnm->iItem);
             }
         }
         return 0;
     }
     case WM_COMMAND: {
         int id = LOWORD(wParam);
+        int notifyCode = HIWORD(wParam);
+        if (id == IDC_PROP_COMBO && notifyCode == CBN_SELCHANGE) {
+            CommitPropEdit();
+            break;
+        }
         if (id == ID_CTX_COPY_PATH) {
              HTREEITEM hItem = TreeView_GetSelection(g_hTreeView);
              if (hItem) {
@@ -955,11 +1505,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
         case IDC_BTN_CLEAR:
-            if (g_CurrentTab == 1) { 
+            if (g_CurrentTab == 1) {
                 SetWindowTextA(g_hEditScript, "");
-            } else { 
+            } else {
                 SetWindowTextA(g_hOutputLog, "");
             }
+            break;
+        case IDC_BTN_NET_CLEAR:
+            SetWindowTextA(g_hNetLog, "");
             break;
         case IDC_BTN_LOAD_FILE: {
             char filename[MAX_PATH] = {};
@@ -988,7 +1541,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     }
+    case WM_TIMER:
+        if (wParam == IDT_NET_FLUSH) {
+            FlushNetLog();
+        }
+        return 0;
     case WM_CLOSE:
+        KillTimer(hwnd, IDT_NET_FLUSH);
         ShowWindow(hwnd, SW_HIDE);
         return 0;
     case WM_DESTROY:
@@ -1031,10 +1590,12 @@ static void CreateUI() {
     SendMessageA(g_hTab, TCM_INSERTITEMA, 0, (LPARAM)&tie);
     tie.pszText = (LPSTR)"Lua Script";
     SendMessageA(g_hTab, TCM_INSERTITEMA, 1, (LPARAM)&tie);
-    tie.pszText = (LPSTR)"CMD";
+    tie.pszText = (LPSTR)"Network Logger";
     SendMessageA(g_hTab, TCM_INSERTITEMA, 2, (LPARAM)&tie);
-    tie.pszText = (LPSTR)"Credits";
+    tie.pszText = (LPSTR)"CMD";
     SendMessageA(g_hTab, TCM_INSERTITEMA, 3, (LPARAM)&tie);
+    tie.pszText = (LPSTR)"Credits";
+    SendMessageA(g_hTab, TCM_INSERTITEMA, 4, (LPARAM)&tie);
     g_hBtnRefresh = CreateWindowA("BUTTON", "Refresh",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         5, 35, 70, 25,
@@ -1063,6 +1624,29 @@ static void CreateUI() {
         WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY | WS_VSCROLL,
         350, 65, 130, 280,
         g_hMainWnd, (HMENU)1100, g_hInstance, NULL);
+    g_hPropListView = CreateWindowA(WC_LISTVIEWA, "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+        350, 150, 130, 200,
+        g_hMainWnd, (HMENU)IDC_PROP_LISTVIEW, g_hInstance, NULL);
+    ListView_SetExtendedListViewStyle(g_hPropListView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNA lvc = {};
+    lvc.mask = LVCF_TEXT | LVCF_WIDTH;
+    lvc.cx = 100;
+    lvc.pszText = (LPSTR)"Property";
+    ListView_InsertColumn(g_hPropListView, 0, &lvc);
+    lvc.cx = 80;
+    lvc.pszText = (LPSTR)"Value";
+    ListView_InsertColumn(g_hPropListView, 1, &lvc);
+    g_hPropEdit = CreateWindowA("EDIT", "",
+        WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        0, 0, 80, 20,
+        g_hMainWnd, (HMENU)IDC_PROP_EDIT, g_hInstance, NULL);
+    g_OrigPropEditProc = (WNDPROC)SetWindowLongPtrA(g_hPropEdit, GWLP_WNDPROC, (LONG_PTR)PropEditSubProc);
+    g_hPropCombo = CreateWindowA("COMBOBOX", "",
+        WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+        0, 0, 80, 200,
+        g_hMainWnd, (HMENU)IDC_PROP_COMBO, g_hInstance, NULL);
+    g_OrigPropComboProc = (WNDPROC)SetWindowLongPtrA(g_hPropCombo, GWLP_WNDPROC, (LONG_PTR)PropComboSubProc);
     g_hEditCmdLog = CreateWindowA("EDIT", "",
         WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
         5, 35, 480, 200,
@@ -1079,6 +1663,14 @@ static void CreateUI() {
         WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
         5, 35, 480, 310,
         g_hMainWnd, (HMENU)IDC_EDIT_SCRIPT, g_hInstance, NULL);
+    g_hNetLog = CreateWindowA("EDIT", "",
+        WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_HSCROLL,
+        5, 35, 480, 280,
+        g_hMainWnd, (HMENU)IDC_NET_LOG, g_hInstance, NULL);
+    g_hBtnNetClear = CreateWindowA("BUTTON", "Clear Log",
+        WS_CHILD | BS_PUSHBUTTON,
+        5, 320, 80, 25,
+        g_hMainWnd, (HMENU)IDC_BTN_NET_CLEAR, g_hInstance, NULL);
     g_hCreditsLabel1 = CreateWindowA("STATIC", "MiiSploit made by Miiself",
         WS_CHILD | SS_CENTER,
         5, 60, 480, 25,
@@ -1112,6 +1704,7 @@ static void CreateUI() {
         5, 450, 480, 70,
         g_hMainWnd, (HMENU)IDC_OUTPUT_LOG, g_hInstance, NULL);
     ShowTabControls(0);
+    SetTimer(g_hMainWnd, IDT_NET_FLUSH, 200, NULL);
     RECT rc;
     GetClientRect(g_hMainWnd, &rc);
     LayoutControls(rc.right, rc.bottom);
@@ -1120,6 +1713,7 @@ DWORD WINAPI UIThread(LPVOID param) {
     HANDLE g = GetModuleHandleA("GameAssembly.dll");
     U::Init(g, U::Mode::Il2Cpp);
     U::ThreadAttach();
+    MH_Initialize();
     CreateUI();
     LogOutput("Welcome to MiiSploit Rewritten v2.0");
     LogOutput("Made by Miiself!");
@@ -1149,6 +1743,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         break;
     case DLL_PROCESS_DETACH:
         g_Running = false;
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
         if (g_hMainWnd) {
             PostMessageA(g_hMainWnd, WM_CLOSE, 0, 0);
         }

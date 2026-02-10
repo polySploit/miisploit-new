@@ -47,6 +47,15 @@
         "xmake -y",
         "xmake -y",
         "xmake ",
-        "xmake "
+        "xmake ",
+        "xmake require --search minhook",
+        "xmake f -c",
+        "xmake -y",
+        "xmake -y",
+        "xmake -y",
+        "xmake -y",
+        "xmake -y",
+        "xmake -y",
+        "xmake -y"
     }
 }
